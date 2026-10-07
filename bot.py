@@ -7,6 +7,7 @@ import os
 import re
 from datetime import datetime
 
+import requests
 from telegram import (
     InlineKeyboardButton as IB,
     InlineKeyboardMarkup as IM,
@@ -43,6 +44,10 @@ STATUS_ICON = {
     STATUSES[3]: "✅",
     STATUSES[4]: "❌",
 }
+
+# ====================== تنظیمات ارتباط با ایجنت دیفای (Dify) ======================
+DIFY_API_KEY = os.getenv("DIFY_API_KEY")
+DIFY_API_URL = os.getenv("DIFY_API_URL", "https://api.dify.ai/v1/chat-messages")
 
 BTN_ADMIN_PANEL = "👑 پنل مدیریت"
 BTN_CATS, BTN_CODE, BTN_CART, BTN_ORDERS, BTN_CONTACT = (
@@ -81,6 +86,35 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO
 )
 log = logging.getLogger("shop")
+
+
+def _ask_dify_sync(query: str, user_id: int) -> str:
+    """ارسال همگام درخواست به ایجنت Dify"""
+    if not DIFY_API_KEY:
+        return "❌ کالایی مطابق جستجو یافت نشد. نام یا کد را بازبینی کرده یا از «دسته‌بندی‌ها» استفاده نمایید."
+    headers = {
+        "Authorization": f"Bearer {DIFY_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "inputs": {},
+        "query": query,
+        "response_mode": "blocking",
+        "conversation_id": "",
+        "user": str(user_id),
+    }
+    try:
+        r = requests.post(DIFY_API_URL, json=payload, headers=headers, timeout=25)
+        data = r.json()
+        return data.get("answer") or "متأسفانه پاسخی دریافت نشد."
+    except Exception as e:
+        log.warning("خطا در ارتباط با دیفای: %s", e)
+        return "در حال حاضر سیستم پاسخگویی هوشمند در دسترس نیست؛ لطفاً کمی بعد امتحان فرمایید."
+
+
+async def ask_dify(query: str, user_id: int) -> str:
+    """ارسال ناهمگام به دیفای جهت جلوگیری از بلاک شدن پردازش ربات"""
+    return await asyncio.to_thread(_ask_dify_sync, query, user_id)
 
 
 def get_main_kb(uid: int) -> ReplyKeyboardMarkup:
@@ -471,10 +505,11 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     else:
         res = await db.search(txt)
         if not res:
-            await u.message.reply_text(
-                "❌ کالایی مطابق جستجو یافت نشد. نام یا کد را بازبینی کرده یا از «دسته‌بندی‌ها» استفاده نمایید."
-            )
+            # اگر محصولی پیدا نشد، پیام مستقیم به ایجنت هوشمند Dify ارجاع داده می‌شود
+            ai_reply = await ask_dify(txt, uid)
+            await u.message.reply_text(ai_reply)
             return
+
         is_adm = db.is_admin(uid) or db.is_owner(uid)
         for p in res[:3]:
             await send_product(u.message, p, is_adm)
