@@ -32,7 +32,8 @@ from util import esc, money, ncode, to_int
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "7048088727"))
-ADMIN_LINK = os.getenv("ADMIN_LINK", "https://t.me/mahdi_reshad_d")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "Mahela_admin").lstrip("@")
+ADMIN_LINK = f"https://t.me/{ADMIN_USERNAME}"
 TAGLINE = "با ماهلا، پوستت ماهه، راهِ زیبایی کوتاه!"
 PAGE_SIZE = 6
 HTML = ParseMode.HTML
@@ -44,6 +45,8 @@ STATUS_ICON = {
     STATUSES[3]: "✅",
     STATUSES[4]: "❌",
 }
+
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 
 # ====================== تنظیمات ارتباط با ایجنت دیفای (Dify) ======================
 DIFY_API_KEY = os.getenv("DIFY_API_KEY")
@@ -78,7 +81,7 @@ MAIN_KB_ADMIN = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 LOC_KB = ReplyKeyboardMarkup(
-    [[KeyboardButton("📍 ارسال موقعیت", request_location=True)], [BTN_CANCEL]],
+    [[KeyboardButton("📍 ارسال موقعیت مکانی (GPS)", request_location=True)], [BTN_CANCEL]],
     resize_keyboard=True,
 )
 
@@ -86,6 +89,43 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO
 )
 log = logging.getLogger("shop")
+
+
+async def get_bot_username(bot) -> str:
+    """دریافت و ذخیره خودکار یوزرنیم ربات جهت ساخت لینک‌های کانال"""
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        me = await bot.get_me()
+        BOT_USERNAME = me.username or ""
+    return BOT_USERNAME
+
+
+def make_product_deeplink(bot_username: str, p: dict) -> str:
+    """ساخت لینک اختصاصی استعلام قیمت هر محصول برای استفاده در کانال"""
+    return f"https://t.me/{bot_username}?start=p_{p['id']}"
+
+
+def channel_teaser_post(p: dict, link: str) -> str:
+    """ساخت متن آماده و شیک برای ارسال به کانال (بدون قیمت + لینک استعلام قیمت)"""
+    lines = [f"✨ <b>{esc(p['name'])}</b>"]
+    if p.get("brand"):
+        lines.append(f"🏷 برند: {esc(p['brand'])}")
+    if p.get("category"):
+        lines.append(f"📂 دسته‌بندی: {esc(p['category'])}")
+    lines.append(f"🔖 کد کالا: <code>{esc(p['code'])}</code>")
+    if p.get("description"):
+        lines.append(f"\n📝 {esc(p['description'][:350])}")
+    extra = json.loads(p.get("extra") or "{}")
+    if extra:
+        lines.append(
+            "\n📋 "
+            + " | ".join(f"{esc(k)}: {esc(v)}" for k, v in list(extra.items())[:5])[:250]
+        )
+    lines.append(
+        f"\n👇 <b>برای مشاهده قیمت روز و ثبت سفارش روی لینک زیر بزنید:</b>\n"
+        f"🔗 <a href=\"{link}\">مشاهده قیمت و خرید آنلاین این محصول</a>"
+    )
+    return "\n".join(lines)[:1000]
 
 
 def _ask_dify_sync(query: str, user_id: int) -> str:
@@ -113,7 +153,6 @@ def _ask_dify_sync(query: str, user_id: int) -> str:
 
 
 async def ask_dify(query: str, user_id: int) -> str:
-    """ارسال ناهمگام به دیفای جهت جلوگیری از بلاک شدن پردازش ربات"""
     return await asyncio.to_thread(_ask_dify_sync, query, user_id)
 
 
@@ -155,7 +194,7 @@ def caption(p: dict, rate: tuple) -> str:
                 :300
             ]
         )
-    lines.append(f"\n💰 <b>{money(p['price'])} تومان</b>")
+    lines.append(f"\n💰 <b>قیمت: {money(p['price'])} تومان</b>")
     return "\n".join(lines)[:1000]
 
 
@@ -171,8 +210,10 @@ def product_kb(p: dict, n: int = 1, admin_user: bool = False) -> IM:
             ]
         )
         rows.append(
-            [IB(f"🛒 افزودن {n} عدد به سبد", callback_data=f"add:{pid}:{n}")]
+            [IB(f"🛒 افزودن {n} عدد به سبد خرید", callback_data=f"add:{pid}:{n}")]
         )
+    else:
+        rows.append([IB("📞 استعلام موجودی از ادمین", url=ADMIN_LINK)])
     rows.append([IB("⭐ امتیاز و نظرات", callback_data=f"rev:{pid}")])
     if admin_user:
         rows.append([IB("⚙️ مدیریت این محصول", callback_data=f"a:pm:{pid}")])
@@ -279,7 +320,7 @@ async def cart_view(uid: int):
     return "\n".join(lines), IM(rows)
 
 
-def order_text(o: dict, admin_mode: bool = False) -> str:
+def order_text(o: dict, admin_mode: bool = False, extra_address: str = "") -> str:
     items = json.loads(o["items"])
     lines = [
         f"🧾 <b>سفارش #{o['id']}</b> — {STATUS_ICON.get(o['status'], '')} {esc(o['status'])}",
@@ -292,6 +333,8 @@ def order_text(o: dict, admin_mode: bool = False) -> str:
         lines.append(
             f"👤 {who} — <a href=\"tg://user?id={o['user_id']}\">پیام به مشتری</a>"
         )
+    if extra_address:
+        lines.append(f"📍 <b>آدرس و تلفن پستی:</b>\n{esc(extra_address)}")
     lines.append("")
     for it in items:
         lines.append(
@@ -329,17 +372,11 @@ async def cmd_orders(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.effective_message.reply_text("\n".join(lines), parse_mode=HTML)
 
 
-async def on_location(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    uid = u.effective_user.id
-    if not c.user_data.get("await_loc"):
-        await u.message.reply_text(
-            "برای ثبت سفارش، از سبد خرید روی «نهایی‌سازی سفارش» بزنید.",
-            reply_markup=get_main_kb(uid),
-        )
-        return
-    user, loc = u.effective_user, u.message.location
+async def finalize_order(u: Update, c: ContextTypes.DEFAULT_TYPE, lat=None, lon=None, address_text: str = ""):
+    user = u.effective_user
+    uid = user.id
     res = await db.create_order(
-        user.id, user.username or "", user.full_name, loc.latitude, loc.longitude
+        uid, user.username or "", user.full_name, lat, lon
     )
     if res["status"] == "empty":
         c.user_data.pop("await_loc", None)
@@ -356,14 +393,16 @@ async def on_location(u: Update, c: ContextTypes.DEFAULT_TYPE):
             parse_mode=HTML,
             reply_markup=get_main_kb(uid),
         )
-        body, kb = await cart_view(user.id)
+        body, kb = await cart_view(uid)
         await u.message.reply_text(body, parse_mode=HTML, reply_markup=kb)
         return
 
     c.user_data.pop("await_loc", None)
     o = res["order"]
     await u.message.reply_text(
-        f"✅ <b>سفارش #{o['id']} با موفقیت ثبت شد!</b>\n💵 مبلغ: {money(o['total'])} تومان\n\nوضعیت سفارش را از «🧾 سفارش‌ها» دنبال کنید. به زودی با شما تماس می‌گیریم 🙏",
+        f"✅ <b>سفارش #{o['id']} با موفقیت ثبت شد!</b>\n"
+        f"💵 مبلغ قابل پرداخت: {money(o['total'])} تومان\n\n"
+        f"وضعیت سفارش را از «🧾 سفارش‌ها» دنبال کنید. همچنین برای هماهنگی با ادمین (@{ADMIN_USERNAME}) می‌توانید در تماس باشید 🙏",
         parse_mode=HTML,
         reply_markup=get_main_kb(uid),
     )
@@ -373,13 +412,12 @@ async def on_location(u: Update, c: ContextTypes.DEFAULT_TYPE):
         try:
             await c.bot.send_message(
                 aid,
-                "🔔 <b>سفارش جدید دریافت شد</b>\n\n" + order_text(o, True),
+                "🔔 <b>سفارش جدید دریافت شد</b>\n\n" + order_text(o, True, address_text),
                 parse_mode=HTML,
                 reply_markup=status_kb(o),
             )
-            await c.bot.send_location(
-                aid, latitude=loc.latitude, longitude=loc.longitude
-            )
+            if lat is not None and lon is not None:
+                await c.bot.send_location(aid, latitude=lat, longitude=lon)
             for p in res["low"]:
                 await c.bot.send_message(
                     aid,
@@ -390,12 +428,65 @@ async def on_location(u: Update, c: ContextTypes.DEFAULT_TYPE):
             log.error("خطا در ارسال اعلان سفارش به ادمین %s: %s", aid, e)
 
 
+async def on_location(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid = u.effective_user.id
+    if not c.user_data.get("await_loc"):
+        await u.message.reply_text(
+            "برای ثبت سفارش، از سبد خرید روی «نهایی‌سازی سفارش» بزنید.",
+            reply_markup=get_main_kb(uid),
+        )
+        return
+    loc = u.message.location
+    await finalize_order(u, c, lat=loc.latitude, lon=loc.longitude)
+
+
 # ====================== کنترلر رویدادهای متنی و فرامین ======================
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
     await db.track_user(uid, u.effective_user.full_name)
     c.user_data["seen"] = True
     c.user_data.pop("flow", None)
+    c.user_data.pop("await_loc", None)
+    c.user_data.pop("awaiting", None)
+
+    is_adm = db.is_admin(uid) or db.is_owner(uid)
+
+    # 🔗 بررسی استعلام قیمت محصول از طریق لینک اختصاصی کانال (Deep Link)
+    if c.args:
+        param = c.args[0].strip()
+        p = None
+        # استعلام از طریق شناسه محصول (مثال: p_15 یا 15)
+        if param.startswith("p_") and param[2:].isdigit():
+            p = await db.get_product(int(param[2:]))
+        elif param.isdigit():
+            p = await db.get_product(int(param))
+        else:
+            # استعلام از طریق کد محصول (مثال: M0001)
+            res = await db.search(param, lim=5)
+            for item in res:
+                if ncode(item.get("code", "")) == ncode(param):
+                    p = item
+                    break
+            if not p and res:
+                p = res[0]
+
+        if p:
+            await u.message.reply_text(
+                f"🌸 <b>{TAGLINE}</b>\n\n"
+                f"👇 مشخصات و قیمت روز محصول انتخابی شما:",
+                parse_mode=HTML,
+                reply_markup=get_main_kb(uid),
+            )
+            await send_product(u.message, p, is_adm)
+            return
+        else:
+            await u.message.reply_text(
+                "⚠️ متأسفانه این محصول یافت نشد یا ممکن است از فروشگاه حذف شده باشد.\n"
+                "می‌توانید نام یا کد کالا را در ربات جستجو فرمایید:",
+                reply_markup=get_main_kb(uid),
+            )
+            return
+
     n = await db.count_products()
     role_msg = ""
     if db.is_owner(uid):
@@ -416,7 +507,8 @@ async def cmd_help(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "ℹ️ <b>راهنمای خرید</b>\n\n"
         "• با انتخاب «دسته‌بندی‌ها» کاتالوگ فروشگاه را مرور فرمایید.\n"
         "• نام یا کد محصول را برای جستجو مستقیم بفرستید.\n"
-        "• در سبد خرید، سفارش را نهایی کرده و موقعیت مکانی تحویل را ارسال کنید."
+        "• در سبد خرید، سفارش را نهایی کرده و موقعیت مکانی تحویل را ارسال کنید.\n"
+        f"• در صورت نیاز به راهنمایی با ادمین در ارتباط باشید: @{ADMIN_USERNAME}"
     )
     if db.is_admin(uid) or db.is_owner(uid):
         t += "\n\n👑 برای ورود به پنل، روی دکمه «👑 پنل مدیریت» در کیبورد بزنید یا از دستور /admin استفاده کنید."
@@ -462,8 +554,18 @@ async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     txt = u.message.text.strip()
     uid = u.effective_user.id
-    aw = c.user_data.get("awaiting")
 
+    # دریافت آدرس متنی به عنوان جایگزین لوکیشن (برای کاربران دسکتاپ)
+    if c.user_data.get("await_loc") and txt not in MENU_TEXTS:
+        if len(txt) < 8:
+            await u.message.reply_text(
+                "⚠️ لطفاً آدرس دقیق پستی به همراه شماره تماس را کامل بنویسید، یا از دکمه «📍 ارسال موقعیت مکانی» استفاده کنید:"
+            )
+            return
+        await finalize_order(u, c, lat=None, lon=None, address_text=txt)
+        return
+
+    aw = c.user_data.get("awaiting")
     if aw and txt not in MENU_TEXTS:
         c.user_data.pop("awaiting", None)
         if aw["t"] == "coupon":
@@ -479,6 +581,7 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     if txt in MENU_TEXTS:
         c.user_data.pop("awaiting", None)
+        c.user_data.pop("await_loc", None)
 
     if txt == BTN_ADMIN_PANEL:
         if db.is_admin(uid) or db.is_owner(uid):
@@ -494,8 +597,11 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await cmd_orders(u, c)
     elif txt == BTN_CONTACT:
         await u.message.reply_text(
-            "📞 پشتیبانی و ارتباط با مدیریت:",
-            reply_markup=IM([[IB("💬 پیام به ادمین", url=ADMIN_LINK)]]),
+            f"📞 <b>پشتیبانی و ارتباط با مدیریت ماهلا</b>\n\n"
+            f"برای مشاوره، پیگیری سفارش یا هرگونه سوال می‌توانید با ادمین در ارتباط باشید:\n"
+            f"🆔 @{ADMIN_USERNAME}",
+            parse_mode=HTML,
+            reply_markup=IM([[IB(f"💬 پیام به ادمین (@{ADMIN_USERNAME})", url=ADMIN_LINK)]]),
         )
     elif txt == BTN_CODE:
         await u.message.reply_text("🔍 نام یا کد کالا را ارسال فرمایید:")
@@ -505,7 +611,6 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     else:
         res = await db.search(txt)
         if not res:
-            # اگر محصولی پیدا نشد، پیام مستقیم به ایجنت هوشمند Dify ارجاع داده می‌شود
             ai_reply = await ask_dify(txt, uid)
             await u.message.reply_text(ai_reply)
             return
@@ -633,7 +738,10 @@ async def user_cb(q, c, d: str, ans, uid: int):
             return
         c.user_data["await_loc"] = True
         await q.message.reply_text(
-            "📍 جهت ثبت نهایی سفارش، موقعیت مکانی (Location) خود را ارسال فرمایید:",
+            "📍 <b>تکمیل سفارش و آدرس:</b>\n\n"
+            "۱. روی دکمه «📍 ارسال موقعیت مکانی (GPS)» در پایین بزنید.\n"
+            "۲. یا <b>آدرس دقیق پستی و شماره تماس</b> خود را در قالب پیام متنی ارسال نمایید:",
+            parse_mode=HTML,
             reply_markup=LOC_KB,
         )
     elif d.startswith("rev:"):
@@ -674,7 +782,7 @@ async def user_cb(q, c, d: str, ans, uid: int):
 # ====================== پنل مدیریت پیشرفته ======================
 def admin_menu_kb(uid: int) -> IM:
     rows = [
-        [IB("➕ افزودن محصول", callback_data="a:add"), IB("🔎 ویرایش / حذف تکی", callback_data="a:find")],
+        [IB("➕ افزودن محصول", callback_data="a:add"), IB("🔎 ویرایش / دریافت لینک کانال", callback_data="a:find")],
         [IB("📥 آپلود اکسل", callback_data="a:xls"), IB("📤 خروجی اکسل", callback_data="a:export")],
         [IB("🧾 سفارش‌ها", callback_data="a:orders"), IB("📊 آمار فروشگاه", callback_data="a:stats")],
         [IB("🎟 مدیریت کوپن‌ها", callback_data="a:coupons"), IB("📈 تخفیف پلکانی", callback_data="a:tiers")],
@@ -701,8 +809,9 @@ async def cmd_admin(u: Update, c: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def admin_card(p: dict) -> tuple:
+def admin_card(p: dict, bot_username: str = "") -> tuple:
     has_photo = "دارد" if p.get("photo") else "ندارد"
+    link = make_product_deeplink(bot_username, p) if bot_username else ""
     text = (
         f"⚙️ <b>مدیریت محصول</b>\n\n"
         f"🔖 کد: <code>{esc(p['code'])}</code>\n"
@@ -711,11 +820,13 @@ def admin_card(p: dict) -> tuple:
         f"📂 دسته: {esc(p['category'])}\n"
         f"💰 قیمت: {money(p['price'])} تومان\n"
         f"📦 موجودی: {p['stock']}\n"
-        f"🖼 تصویر: {has_photo}"
+        f"🖼 تصویر: {has_photo}\n"
+        f"🔗 <b>لینک اختصاصی کانال:</b>\n<code>{link}</code>"
     )
     pid = p["id"]
     kb = IM(
         [
+            [IB("📢 دریافت پست آماده برای کانال", callback_data=f"a:chpost:{pid}")],
             [
                 IB("نام", callback_data=f"a:ep:{pid}:name"),
                 IB("برند", callback_data=f"a:ep:{pid}:brand"),
@@ -751,9 +862,39 @@ BACK_MENU = IM([[IB("🔙 بازگشت به منوی مدیریت", callback_dat
 
 
 async def admin_cb(q, c, d: str, uid: int):
+    bname = await get_bot_username(c.bot)
+
     if d == "menu":
         c.user_data.pop("flow", None)
         await show(q, "👑 <b>پنل مدیریت پیشرفته ماهلا</b>", admin_menu_kb(uid))
+
+    elif d.startswith("chpost:"):
+        pid = int(d.split(":")[1])
+        p = await db.get_product(pid)
+        if p:
+            link = make_product_deeplink(bname, p)
+            post_txt = channel_teaser_post(p, link)
+            btn = IM([[IB("🛒 مشاهده قیمت و خرید", url=link)]])
+            if p.get("photo"):
+                try:
+                    await q.message.reply_photo(
+                        photo=p["photo"],
+                        caption=post_txt,
+                        parse_mode=HTML,
+                        reply_markup=btn,
+                    )
+                    await q.message.reply_text(
+                        "👆 <b>پست بالا آماده است!</b>\nمی‌توانید همین پست را به کانال خود فوروارد کنید یا متنش را کپی کنید.",
+                        parse_mode=HTML,
+                    )
+                    return
+                except TelegramError as e:
+                    log.warning("ارسال تصویر پست کانال مقدور نبود: %s", e)
+            await q.message.reply_text(post_txt, parse_mode=HTML, reply_markup=btn)
+            await q.message.reply_text(
+                "👆 <b>پست بالا آماده است!</b>\nمی‌توانید متن را کپی و در کانال قرار دهید.",
+                parse_mode=HTML,
+            )
 
     elif d == "backup":
         await q.message.reply_text("⏳ در حال استخراج فایل پشتیبان از پایگاه داده...")
@@ -778,7 +919,7 @@ async def admin_cb(q, c, d: str, uid: int):
     elif d.startswith("pm:"):
         p = await db.get_product(int(d[3:]))
         if p:
-            text, kb = admin_card(p)
+            text, kb = admin_card(p, bname)
             await q.message.reply_text(text, parse_mode=HTML, reply_markup=kb)
     elif d.startswith("ep:"):
         _, pid, field = d.split(":")
@@ -815,7 +956,7 @@ async def admin_cb(q, c, d: str, uid: int):
         await show(
             q,
             "⚠️ <b>بخش حذف دسته‌جمعی محصولات</b>\n\n"
-            "هشدار: این عملیات حساس بوده و پیش از حذف کامل، نسخه پشتیبان پایگاه داده برای شما ارسال خواهد شد.",
+            "هشدار: این عملیات حساس بوده و پیش از حذف، نسخه پشتیبان پایگاه داده برای شما ارسال خواهد شد.",
             kb,
         )
     elif d == "delall_pre":
@@ -836,7 +977,7 @@ async def admin_cb(q, c, d: str, uid: int):
             ]
         )
         await q.message.reply_text(
-            "⚠️ <b>تأیید مرحله دوم:</b>\nآیا از حذف <b>تمام محصولات کاتالوگ</b> اطمینان قطعی دارید؟ کلیه سبدهای فعال و نظرات نیز پاکسازی خواهند شد.",
+            "⚠️ <b>تأیید مرحله دوم:</b>\nآیا از حذف <b>تمام محصولات کاتالوگ</b> اطمینان قطعی دارید؟",
             parse_mode=HTML,
             reply_markup=kb,
         )
@@ -877,7 +1018,7 @@ async def admin_cb(q, c, d: str, uid: int):
             return
         c.user_data["flow"] = {"t": "admadd"}
         await q.message.reply_text(
-            "👤 لطفاً <b>شناسه عددی (Numeric Telegram User ID)</b> فرد مورد نظر را ارسال فرمایید:\n(می‌توانید شناسه را با یک فاصله همراه با نام دلخواه بفرستید، مانند: <code>123456789 علی</code>)",
+            "👤 لطفاً <b>شناسه عددی (Numeric Telegram User ID)</b> فرد مورد نظر را ارسال فرمایید:\n(می‌توانید مانند: <code>123456789 علی</code> بفرستید)",
             parse_mode=HTML,
         )
     elif d.startswith("admrem:"):
@@ -893,10 +1034,8 @@ async def admin_cb(q, c, d: str, uid: int):
     elif d == "xls":
         await q.message.reply_text(
             "📥 <b>آپلود هوشمند اکسل</b>\n\n"
-            "فایل اکسل (xlsx / xls) یا CSV را ارسال فرمایید تا به صورت خودکار تحلیل و ذخیره گردد:\n"
-            "• هر شکل جدول، با هر ترتیب ستون، با عناوین فارسی یا انگلیسی پذیرفته می‌شود.\n"
-            "• اگر در کپشن فایل عبارت «جایگزین» را بنویسید، اقلامی که در فایل نیستند از دیتابیس پاک خواهند شد.\n"
-            "• ستون‌های فرعی به عنوان مشخصات تکمیلی کالا ثبت می‌شوند.",
+            "فایل اکسل (xlsx / xls) یا CSV را ارسال فرمایید تا به صورت خودکار ذخیره گردد.\n"
+            "• اگر در کپشن فایل عبارت «جایگزین» را بنویسید، اقلام غایب حذف خواهند شد.",
             parse_mode=HTML,
         )
     elif d == "export":
@@ -941,7 +1080,7 @@ async def admin_cb(q, c, d: str, uid: int):
         if not o:
             return
         if not o["changed"]:
-            await q.message.reply_text("ℹ️ وضعیت تغییر نیافت (سفارش لغوشده بازگردانی نمی‌شود).")
+            await q.message.reply_text("ℹ️ وضعیت تغییر نیافت.")
             return
         await show(q, order_text(o, True), status_kb(o))
         try:
@@ -951,7 +1090,7 @@ async def admin_cb(q, c, d: str, uid: int):
                 parse_mode=HTML,
             )
         except TelegramError:
-            await q.message.reply_text("⚠️ ارسال اعلان به مشتری مقدور نبود (احتمال مسدودی ربات).")
+            await q.message.reply_text("⚠️ ارسال اعلان به مشتری مقدور نبود.")
 
     elif d == "stats":
         s = await db.stats()
@@ -960,7 +1099,7 @@ async def admin_cb(q, c, d: str, uid: int):
             f"📦 کل محصولات: <b>{s['products']}</b> (ناموجود: {s['out']} | کم‌موجودی: {s['low']})\n"
             f"👥 کاربران ثبت‌شده: <b>{s['users']}</b>\n"
             f"🧾 سفارش‌ها: <b>{s['orders']}</b> (در انتظار بررسی: <b>{s['pending']}</b>)\n"
-            f"💰 درآمد کل (بدون لغوشده‌ها): <b>{money(s['revenue'])} تومان</b>\n\n"
+            f"💰 درآمد کل: <b>{money(s['revenue'])} تومان</b>\n\n"
             f"📅 سفارش‌های امروز: <b>{s['today_orders']}</b> | فروش امروز: <b>{money(s['today_revenue'])} تومان</b>\n"
             f"🎟 کدهای تخفیف فعال: <b>{s['coupons']}</b> | تعداد مدیران: <b>{s['admins']}</b>"
         )
@@ -990,7 +1129,7 @@ async def admin_cb(q, c, d: str, uid: int):
         rows.append([IB("➕ افزودن کوپن جدید", callback_data="a:cpadd")])
         rows.append([IB("🧹 حذف کدهای منقضی/تکمیل", callback_data="a:cpdel_exp")])
         rows.append([IB("🚨 حذف تمام کوپن‌ها", callback_data="a:cpdel_all")])
-        rows.append([IB("🔙 بازگشت به منو", callback_data="a:menu")])
+        rows.append([IB("🔙 بازگشت به منو", callback_data="a:menu")],)
         await show(q, "\n".join(lines) if cps else "🎟 هنوز کدی ثبت نشده است.", IM(rows))
     elif d.startswith("cptog:"):
         code = d[6:]
@@ -1005,7 +1144,7 @@ async def admin_cb(q, c, d: str, uid: int):
         await show(q, "🗑 کوپن با موفقیت حذف شد.", BACK_MENU)
     elif d == "cpdel_exp":
         n = await db.del_expired_coupons()
-        await show(q, f"🧹 تعداد {n} کوپن منقضی یا تکمیل‌شده پاکسازی گردید.", BACK_MENU)
+        await show(q, f"🧹 تعداد {n} کوپن منقضی پاکسازی شد.", BACK_MENU)
     elif d == "cpdel_all":
         n = await db.del_all_coupons()
         await show(q, f"🗑 تمام کوپن‌ها ({n} عدد) حذف شدند.", BACK_MENU)
@@ -1013,9 +1152,7 @@ async def admin_cb(q, c, d: str, uid: int):
         c.user_data["flow"] = {"t": "coupon"}
         await q.message.reply_text(
             "🎟 <b>افزودن کد تخفیف جدید</b>\n\n"
-            "فرمت ساده: <code>کد|درصد|سقف_تعداد</code>\nمثال: <code>MAHLA10|10|50</code>\n\n"
-            "فرمت پیشرفته: <code>کد|درصد|مبلغ_ثابت|حداقل_خرید|سقف_تعداد|تاریخ_انقضا(YYYY-MM-DD)|تک‌بار_مصرف(0یا1)</code>\n"
-            "مثال: <code>NOORUZ|0|50000|200000|100|2026-12-29|1</code>",
+            "فرمت ساده: <code>کد|درصد|سقف_تعداد</code>\nمثال: <code>MAHLA10|10|50</code>",
             parse_mode=HTML,
         )
 
@@ -1053,7 +1190,7 @@ async def admin_cb(q, c, d: str, uid: int):
         c.user_data["flow"] = {"t": "ship"}
         cur = await db.get_setting("shipping_fee", "0")
         await q.message.reply_text(
-            f"🚚 هزینه ارسال فعلی: {money(cur)} تومان\nمبلغ جدید را ارسال فرمایید (۰ برای ارسال رایگان):"
+            f"🚚 هزینه ارسال فعلی: {money(cur)} تومان\nمبلغ جدید را ارسال فرمایید (۰ برای رایگان):"
         )
     elif d == "low":
         c.user_data["flow"] = {"t": "low"}
@@ -1068,13 +1205,13 @@ async def admin_cb(q, c, d: str, uid: int):
             return
         c.user_data["flow"] = {"t": d}
         dest = "کلیه کاربران بات" if d == "bc" else "کانال‌ها و گروه‌های ثبت‌شده"
-        await q.message.reply_text(f"📢 محتوای پیام (متن، عکس، ویدیو و ...) را جهت ارسال به {dest} بفرستید:")
+        await q.message.reply_text(f"📢 محتوای پیام را جهت ارسال به {dest} بفرستید:")
     elif d in ("bcok", "bcno"):
         pend = c.user_data.pop("pending_send", None)
         if d == "bcno" or not pend:
             await show(q, "❌ ارسال پیام لغو شد.")
             return
-        await show(q, "⏳ فرآیند ارسال آغاز گردید؛ پس از پایان گزارش ارسال خواهد شد.")
+        await show(q, "⏳ فرآیند ارسال آغاز گردید...")
         c.application.create_task(do_send(c.bot, pend))
     elif d == "ch":
         chans = json.loads(await db.get_setting("channels", "[]"))
@@ -1091,7 +1228,7 @@ async def admin_cb(q, c, d: str, uid: int):
     elif d == "chadd":
         c.user_data["flow"] = {"t": "chadd"}
         await q.message.reply_text(
-            "آیدی عددی یا یوزرنیم کانال/گروه را ارسال فرمایید (ابتدا ربات را ادمین کنید):\nمانند: <code>@channel_id</code> یا <code>-1001234567890</code>",
+            "آیدی عددی یا یوزرنیم کانال/گروه را ارسال فرمایید (ربات باید در آن ادمین باشد):\nمثال: <code>@channel_id</code> یا <code>-1001234567890</code>",
             parse_mode=HTML,
         )
     elif d.startswith("chdel:"):
@@ -1101,12 +1238,12 @@ async def admin_cb(q, c, d: str, uid: int):
             if str(x["id"]) != d[6:]
         ]
         await db.set_setting("channels", json.dumps(chans, ensure_ascii=False))
-        await show(q, "🗑 کانال/گروه با موفقیت حذف گردید.", BACK_MENU)
+        await show(q, "🗑 کانال/گروه حذف گردید.", BACK_MENU)
 
 
 # ====================== جریان تعاملی ورودی‌های ادمین ======================
 ADD_STEPS = [
-    ("code", "🔖 کد محصول را ارسال فرمایید (یا «-» برای تخصیص کد خودکار):"),
+    ("code", "🔖 کد محصول را ارسال فرمایید (یا «-» برای تخصیص خودکار):"),
     ("name", "🛍 نام محصول:"),
     ("brand", "🏷 نام برند (یا «-»):"),
     ("category", "📂 نام دسته‌بندی:"),
@@ -1129,6 +1266,7 @@ async def owner_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, flow: dict):
     m = u.message
     txt = (m.text or m.caption or "").strip()
     t = flow["t"]
+    bname = await get_bot_username(c.bot)
 
     if t == "add":
         key = ADD_STEPS[flow["i"]][0]
@@ -1136,7 +1274,7 @@ async def owner_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, flow: dict):
         if key == "photo":
             val = _photo_value(m, txt)
             if val is None and txt != "-":
-                await m.reply_text("تصویر ارسال نمایید، لینک معتبر بفرستید یا «-» بزنید.")
+                await m.reply_text("تصویر ارسال نمایید، لینک بفرستید یا «-» بزنید.")
                 return
         elif not txt:
             await m.reply_text("ورودی نامعتبر است.")
@@ -1166,7 +1304,7 @@ async def owner_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, flow: dict):
 
         c.user_data.pop("flow", None)
         res, p = await db.save_product(flow["data"])
-        text, kb = admin_card(p)
+        text, kb = admin_card(p, bname)
         status_txt = "✅ کالا افزوده شد." if res == "added" else "✅ کالای هم‌کد به‌روزرسانی شد."
         await m.reply_text(f"{status_txt}\n\n{text}", parse_mode=HTML, reply_markup=kb)
 
@@ -1194,7 +1332,7 @@ async def owner_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, flow: dict):
             return
         c.user_data.pop("flow", None)
         p = await db.get_product(flow["pid"])
-        text, kb = admin_card(p)
+        text, kb = admin_card(p, bname)
         await m.reply_text(f"✅ ویرایش ذخیره گردید.\n\n{text}", parse_mode=HTML, reply_markup=kb)
 
     elif t == "find":
@@ -1203,7 +1341,7 @@ async def owner_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, flow: dict):
         if not res:
             await m.reply_text("❌ کالا یافت نشد.", reply_markup=BACK_MENU)
         elif len(res) == 1:
-            text, kb = admin_card(res[0])
+            text, kb = admin_card(res[0], bname)
             await m.reply_text(text, parse_mode=HTML, reply_markup=kb)
         else:
             await m.reply_text(
@@ -1233,41 +1371,24 @@ async def owner_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, flow: dict):
         if status == "owner":
             await m.reply_text("ℹ️ این شناسه متعلق به مالک اصلی سامانه است.", reply_markup=BACK_MENU)
         elif status == "exists":
-            await m.reply_text(f"ℹ️ شناسه {raw_id} از قبل ادمین بود و مشخصات آن به‌روز شد.", reply_markup=BACK_MENU)
+            await m.reply_text(f"ℹ️ شناسه {raw_id} از قبل ادمین بود.", reply_markup=BACK_MENU)
         else:
-            await m.reply_text(f"✅ کاربر {raw_id} به فهرست ادمین‌ها افزوده گردید.", reply_markup=BACK_MENU)
+            await m.reply_text(f"✅ کاربر {raw_id} به فهرست ادمین‌ها افزوده شد.", reply_markup=BACK_MENU)
 
     elif t == "coupon":
         parts = [x.strip() for x in re.split(r"[|\s,،]+", txt) if x.strip()]
         if len(parts) < 2:
-            await m.reply_text("❌ حداقل وارد کردن کد و مقدار تخفیف الزامی است.")
+            await m.reply_text("❌ حداقل وارد کردن کد و درصد تخفیف الزامی است.")
             return
         code = ncode(parts[0])
         try:
-            if len(parts) <= 3:
-                pct = int(to_int(parts[1], 0))
-                mx = int(to_int(parts[2], 0)) if len(parts) > 2 else 0
-                await db.add_coupon(code=code, percent=pct, max_uses=mx)
-            else:
-                pct = int(to_int(parts[1], 0))
-                fixed = int(to_int(parts[2], 0))
-                min_amt = int(to_int(parts[3], 0))
-                mx = int(to_int(parts[4], 0)) if len(parts) > 4 else 0
-                exp = parts[5] if len(parts) > 5 and parts[5] != "-" else None
-                one_per = int(to_int(parts[6], 0)) if len(parts) > 6 else 0
-                await db.add_coupon(
-                    code=code,
-                    percent=pct,
-                    fixed=fixed,
-                    min_amount=min_amt,
-                    max_uses=mx,
-                    expires_at=exp,
-                    one_per_user=one_per,
-                )
+            pct = int(to_int(parts[1], 0))
+            mx = int(to_int(parts[2], 0)) if len(parts) > 2 else 0
+            await db.add_coupon(code=code, percent=pct, max_uses=mx)
             c.user_data.pop("flow", None)
             await m.reply_text(f"✅ کوپن تخفیف {code} ذخیره شد.", reply_markup=BACK_MENU)
         except Exception as e:
-            await m.reply_text(f"❌ خطا در پردازش اطلاعات کوپن: {e}")
+            await m.reply_text(f"❌ خطا در پردازش کوپن: {e}")
 
     elif t == "tier":
         parts = [x for x in re.split(r"[|\s,،]+", txt) if x]
@@ -1378,7 +1499,7 @@ async def import_excel(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if ext not in ("xlsx", "xlsm", "xls", "csv", "tsv", "txt"):
         await m.reply_text("تنها ارسال فایل اکسل یا CSV مجاز است.")
         return
-    status_msg = await m.reply_text("⏳ در حال خواندن و اعتبارسنجی فایل...")
+    status_msg = await m.reply_text("⏳ در حال پردازش فایل...")
     try:
         f = await doc.get_file()
         data = bytes(await f.download_as_bytearray())
@@ -1401,11 +1522,6 @@ async def import_excel(u: Update, c: ContextTypes.DEFAULT_TYPE):
     ]
     if replace_mode:
         lines.append(f"🗑 اقلام حذف‌شده (غایب در فایل): {r['removed']}")
-    lines.append("\n🧭 ستون‌های شناسایی‌شده:\n" + "\n".join(esc(x) for x in res["mapping"]))
-    if res["stock_missing"]:
-        lines.append(
-            f"⚠️ ستون موجودی یافت نشد؛ پیش‌فرض انبار ({db.DEFAULT_STOCK}) اعمال گردید."
-        )
     lines += [esc(x) for x in res["notes"]]
     await status_msg.edit_text("\n".join(lines)[:4000], parse_mode=HTML)
 
@@ -1416,12 +1532,7 @@ async def on_error(u: object, c: ContextTypes.DEFAULT_TYPE):
     if isinstance(err, NetworkError):
         log.warning("خطای شبکه گذرا: %s", err)
         return
-    log.error("خطای پیش‌بینی‌نشده در اجرای ربات", exc_info=err)
-    try:
-        if isinstance(u, Update) and u.effective_message:
-            await u.effective_message.reply_text("⚠️ خطایی رخ داد؛ لطفاً دوباره تلاش نمایید.")
-    except TelegramError:
-        pass
+    log.error("خطای پیش‌بینی‌نشده", exc_info=err)
 
 
 def main():
