@@ -48,9 +48,11 @@ STATUS_ICON = {
 
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 
-# ====================== تنظیمات ارتباط با ایجنت دیفای (Dify) ======================
+# ====================== تنظیمات دیفای (Dify) ======================
 DIFY_API_KEY = os.getenv("DIFY_API_KEY")
 DIFY_API_URL = os.getenv("DIFY_API_URL", "https://api.dify.ai/v1/chat-messages")
+DIFY_DATASET_ID = os.getenv("DIFY_DATASET_ID")
+DIFY_DATASET_API_KEY = os.getenv("DIFY_DATASET_API_KEY")
 
 BTN_ADMIN_PANEL = "👑 پنل مدیریت"
 BTN_CATS, BTN_CODE, BTN_CART, BTN_ORDERS, BTN_CONTACT = (
@@ -92,7 +94,6 @@ log = logging.getLogger("shop")
 
 
 async def get_bot_username(bot) -> str:
-    """دریافت و ذخیره خودکار یوزرنیم ربات جهت ساخت لینک‌های کانال"""
     global BOT_USERNAME
     if not BOT_USERNAME:
         me = await bot.get_me()
@@ -101,12 +102,10 @@ async def get_bot_username(bot) -> str:
 
 
 def make_product_deeplink(bot_username: str, p: dict) -> str:
-    """ساخت لینک اختصاصی استعلام قیمت هر محصول برای استفاده در کانال"""
     return f"https://t.me/{bot_username}?start=p_{p['id']}"
 
 
 def channel_teaser_post(p: dict, link: str) -> str:
-    """ساخت متن آماده و شیک برای ارسال به کانال (بدون قیمت + لینک استعلام قیمت)"""
     lines = [f"✨ <b>{esc(p['name'])}</b>"]
     if p.get("brand"):
         lines.append(f"🏷 برند: {esc(p['brand'])}")
@@ -128,8 +127,88 @@ def channel_teaser_post(p: dict, link: str) -> str:
     return "\n".join(lines)[:1000]
 
 
+# ====================== همگام‌سازی خودکار کاتالوگ با Dify Knowledge ======================
+def _sync_to_dify_sync():
+    if not DIFY_DATASET_API_KEY or not DIFY_DATASET_ID:
+        log.info("اطلاعات DIFY_DATASET_API_KEY یا DIFY_DATASET_ID تعریف نشده است.")
+        return False
+
+    prods = db._all("SELECT * FROM products ORDER BY category, name")
+    if not prods:
+        catalog_text = "در حال حاضر هیچ محصولی در فروشگاه ماهلا موجود نمی‌باشد."
+    else:
+        lines = [
+            f"فهرست کامل و رسمی محصولات فروشگاه لوازم آرایشی و بهداشتی ماهلا (به‌روزرسانی: {datetime.now().strftime('%Y-%m-%d %H:%M')}):",
+            "نکته: قیمت‌ها به تومان است و ثبت سفارش از طریق ربات تلگرام انجام می‌شود.\n",
+        ]
+        for p in prods:
+            st = f"موجود (تعداد: {p['stock']})" if p["stock"] > 0 else "ناموجود"
+            lines.append(
+                f"• نام محصول: {p['name']}\n"
+                f"  کد کالا: {p['code']} | برند: {p.get('brand') or 'نامشخص'} | دسته: {p['category']}\n"
+                f"  قیمت: {p['price']:,} تومان | وضعیت انبار: {st}"
+            )
+            if p.get("description"):
+                lines.append(f"  توضیحات و ویژگی‌ها: {p['description']}")
+            extra = json.loads(p.get("extra") or "{}")
+            if extra:
+                ex_str = " | ".join(f"{k}: {v}" for k, v in extra.items())
+                lines.append(f"  سایر مشخصات: {ex_str}")
+            lines.append("-" * 30)
+        catalog_text = "\n".join(lines)
+
+    headers = {
+        "Authorization": f"Bearer {DIFY_DATASET_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    doc_id = db._get("dify_doc_id")
+
+    if doc_id:
+        update_url = f"https://api.dify.ai/v1/datasets/{DIFY_DATASET_ID}/documents/{doc_id}/update_by_text"
+        try:
+            r = requests.post(
+                update_url,
+                json={"name": "کاتالوگ محصولات ماهلا", "text": catalog_text},
+                headers=headers,
+                timeout=30,
+            )
+            if r.status_code in (200, 201):
+                log.info("✅ پایگاه دانش دیفای با موفقیت به‌روزرسانی شد.")
+                return True
+        except Exception as e:
+            log.warning("عدم موفقیت در آپدیت سند قبلی دیفای: %s", e)
+
+    create_url = f"https://api.dify.ai/v1/datasets/{DIFY_DATASET_ID}/document/create_by_text"
+    payload = {
+        "name": "کاتالوگ محصولات ماهلا",
+        "text": catalog_text,
+        "indexing_technique": "high_quality",
+        "process_rule": {"mode": "automatic"},
+    }
+    try:
+        r = requests.post(create_url, json=payload, headers=headers, timeout=35)
+        if r.status_code in (200, 201):
+            res_data = r.json()
+            new_id = res_data.get("document", {}).get("id")
+            if new_id:
+                db._ex(
+                    "INSERT INTO settings(key,value) VALUES('dify_doc_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (new_id,),
+                )
+            log.info("✅ سند جدید در پایگاه دانش دیفای با شناسه %s ایجاد شد.", new_id)
+            return True
+        else:
+            log.error("خطا در پاسخ ساخت سند دیفای: %s - %s", r.status_code, r.text)
+    except Exception as e:
+        log.error("خطا در اتصال به API دیفای: %s", e)
+    return False
+
+
+async def trigger_dify_sync():
+    await asyncio.to_thread(_sync_to_dify_sync)
+
+
 def _ask_dify_sync(query: str, user_id: int) -> str:
-    """ارسال همگام درخواست به ایجنت Dify"""
     if not DIFY_API_KEY:
         return "❌ کالایی مطابق جستجو یافت نشد. نام یا کد را بازبینی کرده یا از «دسته‌بندی‌ها» استفاده نمایید."
     headers = {
@@ -440,7 +519,7 @@ async def on_location(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await finalize_order(u, c, lat=loc.latitude, lon=loc.longitude)
 
 
-# ====================== کنترلر رویدادهای متنی و فرامین ======================
+# ====================== کنترلر فرامین و رویدادهای متنی ======================
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
     await db.track_user(uid, u.effective_user.full_name)
@@ -451,17 +530,15 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     is_adm = db.is_admin(uid) or db.is_owner(uid)
 
-    # 🔗 بررسی استعلام قیمت محصول از طریق لینک اختصاصی کانال (Deep Link)
+    # بررسی لینک کانال برای استعلام قیمت
     if c.args:
         param = c.args[0].strip()
         p = None
-        # استعلام از طریق شناسه محصول (مثال: p_15 یا 15)
         if param.startswith("p_") and param[2:].isdigit():
             p = await db.get_product(int(param[2:]))
         elif param.isdigit():
             p = await db.get_product(int(param))
         else:
-            # استعلام از طریق کد محصول (مثال: M0001)
             res = await db.search(param, lim=5)
             for item in res:
                 if ncode(item.get("code", "")) == ncode(param):
@@ -555,7 +632,6 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     txt = u.message.text.strip()
     uid = u.effective_user.id
 
-    # دریافت آدرس متنی به عنوان جایگزین لوکیشن (برای کاربران دسکتاپ)
     if c.user_data.get("await_loc") and txt not in MENU_TEXTS:
         if len(txt) < 8:
             await u.message.reply_text(
@@ -635,7 +711,7 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             )
 
 
-# ====================== پردازش کلیک‌های دکمه‌های شیشه‌ای ======================
+# ====================== کلیک‌های دکمه‌های شیشه‌ای ======================
 async def on_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     d = q.data or ""
@@ -779,11 +855,12 @@ async def user_cb(q, c, d: str, ans, uid: int):
         )
 
 
-# ====================== پنل مدیریت پیشرفته ======================
+# ====================== پنل مدیریت ======================
 def admin_menu_kb(uid: int) -> IM:
     rows = [
         [IB("➕ افزودن محصول", callback_data="a:add"), IB("🔎 ویرایش / دریافت لینک کانال", callback_data="a:find")],
         [IB("📥 آپلود اکسل", callback_data="a:xls"), IB("📤 خروجی اکسل", callback_data="a:export")],
+        [IB("🔄 همگام‌سازی دستی با هوش مصنوعی", callback_data="a:syncdify")],
         [IB("🧾 سفارش‌ها", callback_data="a:orders"), IB("📊 آمار فروشگاه", callback_data="a:stats")],
         [IB("🎟 مدیریت کوپن‌ها", callback_data="a:coupons"), IB("📈 تخفیف پلکانی", callback_data="a:tiers")],
         [IB("🚚 هزینه ارسال", callback_data="a:ship"), IB("⚠️ آستانه موجودی کم", callback_data="a:low")],
@@ -868,6 +945,14 @@ async def admin_cb(q, c, d: str, uid: int):
         c.user_data.pop("flow", None)
         await show(q, "👑 <b>پنل مدیریت پیشرفته ماهلا</b>", admin_menu_kb(uid))
 
+    elif d == "syncdify":
+        await q.message.reply_text("⏳ در حال همگام‌سازی کاتالوگ با هوش مصنوعی Dify...")
+        ok = await asyncio.to_thread(_sync_to_dify_sync)
+        if ok:
+            await q.message.reply_text("✅ تمام محصولات با موفقیت به پایگاه دانش Dify ارسال شدند.")
+        else:
+            await q.message.reply_text("⚠️ همگام‌سازی با خطا مواجه شد. لطفاً متغیرهای DIFY_DATASET_ID و DIFY_DATASET_API_KEY را در Railway بررسی فرمایید.")
+
     elif d.startswith("chpost:"):
         pid = int(d.split(":")[1])
         p = await db.get_product(pid)
@@ -884,7 +969,7 @@ async def admin_cb(q, c, d: str, uid: int):
                         reply_markup=btn,
                     )
                     await q.message.reply_text(
-                        "👆 <b>پست بالا آماده است!</b>\nمی‌توانید همین پست را به کانال خود فوروارد کنید یا متنش را کپی کنید.",
+                        "👆 <b>پست بالا آماده است!</b>\nمی‌توانید همین پست را به کانال خود فوروارد کنید.",
                         parse_mode=HTML,
                     )
                     return
@@ -943,7 +1028,8 @@ async def admin_cb(q, c, d: str, uid: int):
         )
     elif d.startswith("dpy:"):
         await db.delete_product(int(d[4:]))
-        await show(q, "🗑 محصول مورد نظر حذف شد.", BACK_MENU)
+        asyncio.create_task(trigger_dify_sync())
+        await show(q, "🗑 محصول حذف شد و پایگاه دانش Dify نیز به‌روزرسانی گردید.", BACK_MENU)
 
     elif d == "delprod_menu":
         kb = IM(
@@ -955,12 +1041,11 @@ async def admin_cb(q, c, d: str, uid: int):
         )
         await show(
             q,
-            "⚠️ <b>بخش حذف دسته‌جمعی محصولات</b>\n\n"
-            "هشدار: این عملیات حساس بوده و پیش از حذف، نسخه پشتیبان پایگاه داده برای شما ارسال خواهد شد.",
+            "⚠️ <b>بخش حذف دسته‌جمعی محصولات</b>\n\nپیش از حذف کامل، نسخه پشتیبان پایگاه داده برای شما ارسال خواهد شد.",
             kb,
         )
     elif d == "delall_pre":
-        await q.message.reply_text("⏳ در حال تهیه نسخه پشتیبان پیش از حذف کامل...")
+        await q.message.reply_text("⏳ در حال تهیه نسخه پشتیبان پیش از حذف...")
         bdata = await db.backup_bytes()
         now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         bio = io.BytesIO(bdata)
@@ -977,13 +1062,14 @@ async def admin_cb(q, c, d: str, uid: int):
             ]
         )
         await q.message.reply_text(
-            "⚠️ <b>تأیید مرحله دوم:</b>\nآیا از حذف <b>تمام محصولات کاتالوگ</b> اطمینان قطعی دارید؟",
+            "⚠️ <b>تأیید نهایی:</b> آیا از حذف <b>تمام محصولات کاتالوگ</b> اطمینان قطعی دارید؟",
             parse_mode=HTML,
             reply_markup=kb,
         )
     elif d == "delall_confirm":
         count = await db.delete_all_products()
-        await show(q, f"🗑 عملیات پایان یافت. مجموعاً <b>{count}</b> محصول به طور کامل حذف شد.", BACK_MENU)
+        asyncio.create_task(trigger_dify_sync())
+        await show(q, f"🗑 مجموعاً <b>{count}</b> محصول حذف و پایگاه دانش Dify تخلیه گردید.", BACK_MENU)
     elif d == "delout_pre":
         kb = IM(
             [
@@ -994,7 +1080,8 @@ async def admin_cb(q, c, d: str, uid: int):
         await show(q, "⚠️ آیا از حذف کلیه محصولات ناموجود (موجودی صفر) اطمینان دارید؟", kb)
     elif d == "delout_confirm":
         count = await db.delete_out_of_stock()
-        await show(q, f"🗑 عملیات انجام شد. تعداد <b>{count}</b> محصول ناموجود پاکسازی گردید.", BACK_MENU)
+        asyncio.create_task(trigger_dify_sync())
+        await show(q, f"🗑 تعداد <b>{count}</b> محصول ناموجود پاکسازی و هوش مصنوعی به‌روزرسانی شد.", BACK_MENU)
 
     elif d == "admins":
         if not db.is_owner(uid):
@@ -1018,7 +1105,7 @@ async def admin_cb(q, c, d: str, uid: int):
             return
         c.user_data["flow"] = {"t": "admadd"}
         await q.message.reply_text(
-            "👤 لطفاً <b>شناسه عددی (Numeric Telegram User ID)</b> فرد مورد نظر را ارسال فرمایید:\n(می‌توانید مانند: <code>123456789 علی</code> بفرستید)",
+            "👤 لطفاً <b>شناسه عددی (Numeric Telegram User ID)</b> فرد را بفرستید:\n(مثال: <code>123456789 علی</code>)",
             parse_mode=HTML,
         )
     elif d.startswith("admrem:"):
@@ -1033,9 +1120,7 @@ async def admin_cb(q, c, d: str, uid: int):
 
     elif d == "xls":
         await q.message.reply_text(
-            "📥 <b>آپلود هوشمند اکسل</b>\n\n"
-            "فایل اکسل (xlsx / xls) یا CSV را ارسال فرمایید تا به صورت خودکار ذخیره گردد.\n"
-            "• اگر در کپشن فایل عبارت «جایگزین» را بنویسید، اقلام غایب حذف خواهند شد.",
+            "📥 <b>آپلود هوشمند اکسل</b>\n\nفایل اکسل (xlsx / xls) یا CSV را ارسال فرمایید.\n• با نوشتن «جایگزین» در کپشن، اقلام غایب حذف خواهند شد.",
             parse_mode=HTML,
         )
     elif d == "export":
@@ -1047,7 +1132,7 @@ async def admin_cb(q, c, d: str, uid: int):
         await q.message.reply_document(
             document=data,
             filename="mahla-products.xlsx",
-            caption=f"📤 خروجی کاتالوگ فروشگاه شامل {len(prods)} محصول",
+            caption=f"📤 خروجی کاتالوگ شامل {len(prods)} محصول",
         )
 
     elif d == "orders":
@@ -1065,7 +1150,7 @@ async def admin_cb(q, c, d: str, uid: int):
             for o in orders
         ]
         rows.append([IB("🔙 بازگشت به منو", callback_data="a:menu")])
-        await show(q, "🧾 <b>مدیریت سفارش‌ها</b> (سفارش‌های فعال در صدر):", IM(rows))
+        await show(q, "🧾 <b>مدیریت سفارش‌ها</b>:", IM(rows))
     elif d.startswith("o:"):
         o = await db.get_order(int(d[2:]))
         if o:
@@ -1129,7 +1214,7 @@ async def admin_cb(q, c, d: str, uid: int):
         rows.append([IB("➕ افزودن کوپن جدید", callback_data="a:cpadd")])
         rows.append([IB("🧹 حذف کدهای منقضی/تکمیل", callback_data="a:cpdel_exp")])
         rows.append([IB("🚨 حذف تمام کوپن‌ها", callback_data="a:cpdel_all")])
-        rows.append([IB("🔙 بازگشت به منو", callback_data="a:menu")],)
+        rows.append([IB("🔙 بازگشت به منو", callback_data="a:menu")])
         await show(q, "\n".join(lines) if cps else "🎟 هنوز کدی ثبت نشده است.", IM(rows))
     elif d.startswith("cptog:"):
         code = d[6:]
@@ -1151,8 +1236,7 @@ async def admin_cb(q, c, d: str, uid: int):
     elif d == "cpadd":
         c.user_data["flow"] = {"t": "coupon"}
         await q.message.reply_text(
-            "🎟 <b>افزودن کد تخفیف جدید</b>\n\n"
-            "فرمت ساده: <code>کد|درصد|سقف_تعداد</code>\nمثال: <code>MAHLA10|10|50</code>",
+            "🎟 <b>افزودن کد تخفیف جدید</b>\n\nفرمت ساده: <code>کد|درصد|سقف_تعداد</code>\nمثال: <code>MAHLA10|10|50</code>",
             parse_mode=HTML,
         )
 
@@ -1228,7 +1312,7 @@ async def admin_cb(q, c, d: str, uid: int):
     elif d == "chadd":
         c.user_data["flow"] = {"t": "chadd"}
         await q.message.reply_text(
-            "آیدی عددی یا یوزرنیم کانال/گروه را ارسال فرمایید (ربات باید در آن ادمین باشد):\nمثال: <code>@channel_id</code> یا <code>-1001234567890</code>",
+            "آیدی عددی یا یوزرنیم کانال/گروه را ارسال فرمایید:\nمثال: <code>@channel_id</code> یا <code>-1001234567890</code>",
             parse_mode=HTML,
         )
     elif d.startswith("chdel:"):
@@ -1241,7 +1325,7 @@ async def admin_cb(q, c, d: str, uid: int):
         await show(q, "🗑 کانال/گروه حذف گردید.", BACK_MENU)
 
 
-# ====================== جریان تعاملی ورودی‌های ادمین ======================
+# ====================== جریان‌های ورودی ادمین ======================
 ADD_STEPS = [
     ("code", "🔖 کد محصول را ارسال فرمایید (یا «-» برای تخصیص خودکار):"),
     ("name", "🛍 نام محصول:"),
@@ -1304,8 +1388,9 @@ async def owner_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, flow: dict):
 
         c.user_data.pop("flow", None)
         res, p = await db.save_product(flow["data"])
+        asyncio.create_task(trigger_dify_sync())
         text, kb = admin_card(p, bname)
-        status_txt = "✅ کالا افزوده شد." if res == "added" else "✅ کالای هم‌کد به‌روزرسانی شد."
+        status_txt = "✅ کالا افزوده شد و به حافظه دیفای هم اضافه گردید." if res == "added" else "✅ کالای هم‌کد به‌روزرسانی شد."
         await m.reply_text(f"{status_txt}\n\n{text}", parse_mode=HTML, reply_markup=kb)
 
     elif t == "edit":
@@ -1331,9 +1416,10 @@ async def owner_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, flow: dict):
             await m.reply_text("❌ این کد کالا تکراری است. کد دیگری بفرستید:")
             return
         c.user_data.pop("flow", None)
+        asyncio.create_task(trigger_dify_sync())
         p = await db.get_product(flow["pid"])
         text, kb = admin_card(p, bname)
-        await m.reply_text(f"✅ ویرایش ذخیره گردید.\n\n{text}", parse_mode=HTML, reply_markup=kb)
+        await m.reply_text(f"✅ ویرایش ذخیره گردید و در دیفای نیز به‌روزرسانی شد.\n\n{text}", parse_mode=HTML, reply_markup=kb)
 
     elif t == "find":
         c.user_data.pop("flow", None)
@@ -1516,17 +1602,21 @@ async def import_excel(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     replace_mode = "جایگزین" in (m.caption or "")
     r = await db.bulk_upsert(res["products"], replace=replace_mode)
+
+    asyncio.create_task(trigger_dify_sync())
+
     lines = [
         f"✅ <b>{len(res['products'])} محصول پردازش گردید</b>",
         f"🆕 کالاهای جدید: {r['added']} | 🔄 به‌روزرسانی‌شده: {r['updated']}",
     ]
     if replace_mode:
         lines.append(f"🗑 اقلام حذف‌شده (غایب در فایل): {r['removed']}")
+    lines.append("\n🤖 <i>کاتالوگ محصولات جهت پاسخگویی خودکار به پایگاه دانش هوش مصنوعی نیز ارسال گردید.</i>")
     lines += [esc(x) for x in res["notes"]]
     await status_msg.edit_text("\n".join(lines)[:4000], parse_mode=HTML)
 
 
-# ====================== مدیریت خطاها و نقطه ورود برنامه ======================
+# ====================== مدیریت خطاها و راه‌اندازی ======================
 async def on_error(u: object, c: ContextTypes.DEFAULT_TYPE):
     err = c.error
     if isinstance(err, NetworkError):
